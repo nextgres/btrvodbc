@@ -144,12 +144,14 @@ typedef struct {
   UT_hash_handle                hh_column_name;
 } btrvodbc_field_definition_t;
 
-typedef struct {
-  BTI_SINT                      file_id;
-  BTI_SINT                      field_id;
-  BTI_SINT                      number;
-  BTI_SINT                      part;
-  BTI_SINT                      flags;
+typedef struct btrvodbc_index_definition_t {
+  BTI_SINT                            file_id;
+  BTI_SINT                            field_id;
+  BTI_CHAR                            number;
+  BTI_CHAR                            part;
+  BTI_SINT                            flags;
+  struct btrvodbc_index_definition_t *next;
+  UT_hash_handle                      hh_number;
 } btrvodbc_index_definition_t;
 
 typedef struct {
@@ -163,6 +165,7 @@ typedef struct {
   btrvodbc_field_definition_t  *fields_by_id;
   btrvodbc_field_definition_t  *fields_by_name;
   btrvodbc_field_definition_t  *fields_by_column_name;
+  btrvodbc_index_definition_t  *indices_by_number;
   UT_hash_handle                hh_id;
   UT_hash_handle                hh_path;
 } btrvodbc_file_definition_t;
@@ -170,6 +173,7 @@ typedef struct {
 typedef struct btrvodbc_position_t {
   btrvodbc_file_definition_t   *file;
   SQLHSTMT                      hstmt;
+  sds                           query;
   BTI_CHAR                      key_number;
   uint32_t                      key_buffer_hash;
   SQLPOINTER                    results[MAXFIELDS];
@@ -406,6 +410,7 @@ BTRVODBC_DEFINE_HANDLER(b_open) {
     file_entry->id, file_entry->table_name);
 
   position = calloc(1, sizeof(*position));
+  position->key_number = -1;
   position->file = file_entry;
   LL_APPEND(client->positions, position);
 
@@ -445,6 +450,54 @@ BTRVODBC_DEFINE_HANDLER(b_open) {
                        (SQLCHAR*) NULL, 0, NULL, 0);
   CHECK_ERROR(retcode, "SQLConnect(DATASOURCE)",
               client->hdbc, SQL_HANDLE_DBC);
+
+  // Allocate Statement Handle
+  retcode = SQLAllocHandle(SQL_HANDLE_STMT, client->hdbc,
+    &position->hstmt);
+  CHECK_ERROR(retcode, "SQLAllocHandle(SQL_HANDLE_STMT)",
+              position->hstmt, SQL_HANDLE_STMT);
+
+  // Set the SQL_ATTR_ROW_BIND_TYPE statement attribute to use column-wise
+  // binding. Declare the rowset size with the SQL_ATTR_ROW_ARRAY_SIZE
+  // statement attribute. Set the SQL_ATTR_ROW_STATUS_PTR statement
+  // attribute to point to the row status array.
+  SQLSetStmtAttr(position->hstmt, SQL_ATTR_CURSOR_TYPE,
+    (SQLPOINTER) SQL_CURSOR_KEYSET_DRIVEN, 0);
+  SQLSetStmtAttr(position->hstmt, SQL_ATTR_ROW_BIND_TYPE,
+    (SQLPOINTER) SQL_BIND_BY_COLUMN, 0);
+
+  /*
+   * Iterate over each field in our structure allocating the appropriate amount
+   * of memory for it, binding it to our statement, and adding it to our base
+   * SQL query.
+   */
+  position->query = sdsnew("SELECT ");
+  int ii = 0;
+  btrvodbc_field_definition_t *fld, *fldtmp;
+  HASH_ITER(hh_id, file_entry->fields_by_id, fld, fldtmp) {
+    if (0 < ii) {
+      position->query = sdscat(position->query, ", ");
+    }
+
+    //AllocBuffer(ColumnSize, &position->results[ii],
+    log_debug("Allocating %zd bytes for field [%s]",
+      (size_t) fld->size, fld->name);
+
+    AllocBuffer(128, &position->results[ii],
+      &position->result_lengths[ii]);
+    retcode = SQLBindCol(position->hstmt, (ii + 1), SQL_C_CHAR,
+      position->results[ii], position->result_lengths[ii],
+      &position->result_lengths_or_indicators[ii]);
+    CHECK_ERROR(retcode, "SQLBindCol()", position->hstmt,
+      SQL_HANDLE_STMT);
+
+    /* Add this field to our base SQL query */
+    position->query = sdscat(position->query, fld->column_name);
+
+    ++ii;
+  }
+  position->query = sdscatfmt(position->query, " FROM %s",
+    file_entry->table_name);
 
   return B_NO_ERROR;
 exit:
@@ -544,356 +597,18 @@ BTRVODBC_DEFINE_HANDLER(b_delete) {
 /* ------------------------------------------------------------------------- */
 
 BTRVODBC_DEFINE_HANDLER(b_get_equal) {
+  /*
+   * Build row-set comparison of keys as:
+   *
+   *  SELECT col0, ..., colN
+   *    FROM table
+   *   WHERE (col0_in_key, ..., colN_in_key)
+   *            = (keyBuffer[col0_offset], ..., keyBuffer[colN_offset])
+   *   ORDER BY col0_in_key, ..., colN_in_key;
+   */
   log_trace("Entering Function %s", __func__);
   return btrvodbc_common_get(operation, posBlock, dataBuffer,
     dataLength, keyBuffer, keyLength, ckeynum, clientID);
-
-  log_fatal("*** YIKERS *** %s", __func__);
-#if 0
-  SQLUINTEGER fetch_offset;
-  SQLSMALLINT fetch_orientation;
-
-  btrvodbc_prepare();
-
-  fetch_offset = SQL_FETCH_FIRST;
-  fetch_orientation = 0;
-#endif
-  SQLRETURN retcode;      // Return status
-  
-  btrvodbc_client_t *client = btrvodbc_upsert_client(clientID);
-  btrvodbc_position_pointer_t *posptr =
-    (btrvodbc_position_pointer_t *) posBlock;
-  btrvodbc_position_t *position = posptr->position;
-  btrvodbc_file_definition_t *file_entry = position->file;
-  
-  log_trace("File id is %"PRId16" with SQL Table [%s]",
-    file_entry->id, file_entry->table_name);
-
-  if (client != posptr->client) {
-    log_error("Trying to use someone else's posblock?");
-    abort();
-  }
-
-  SQLLEN      status;
-  SQLSMALLINT statuslen;
-  SQLPOINTER  ParamPtrArray[MAXFIELDS];
-  SQLLEN      ParamBufferLenArray[MAXFIELDS];
-  SQLLEN      ParamLenOrIndArray[MAXFIELDS];
-
-  SQLPOINTER  ColPtrArray[MAXFIELDS];
-  SQLPOINTER  ColNameArray[MAXFIELDS];
-  SQLLEN      ColBufferLenArray[MAXFIELDS];
-  SQLLEN      ColLenOrIndArray[MAXFIELDS];
-  SQLSMALLINT ColDataTypeArray[MAXFIELDS];
-
-  char *Str;
-  PTR  pParamID;
-  int ii, j=0;
-
-  SQLCHAR textBatch [MAXBATCHSIZE];
-
-  SQLCHAR     ColName[255];
-  SQLSMALLINT ColNameLen;
-  SQLULEN     ColumnSize;
-  SQLLEN      siText;
-
-  // initialise pointer arrays so can be freed
-  for (ii=0;ii<MAXFIELDS;ii++) {
-    ParamPtrArray[ii]=NULL;
-  }
-
-  for (ii=0;ii<MAXFIELDS;ii++) {
-    ColPtrArray[ii]=NULL;
-  }
-
-  // Allocate Statement Handle
-  retcode = SQLAllocHandle(SQL_HANDLE_STMT, client->hdbc,
-    &position->hstmt);
-  CHECK_ERROR(retcode, "SQLAllocHandle(SQL_HANDLE_STMT)",
-              position->hstmt, SQL_HANDLE_STMT);
-
-  // Set the SQL_ATTR_ROW_BIND_TYPE statement attribute to use column-wise
-  // binding. Declare the rowset size with the SQL_ATTR_ROW_ARRAY_SIZE
-  // statement attribute. Set the SQL_ATTR_ROW_STATUS_PTR statement
-  // attribute to point to the row status array.
-  SQLSetStmtAttr(position->hstmt, SQL_ATTR_CURSOR_TYPE,  (SQLPOINTER) SQL_CURSOR_KEYSET_DRIVEN, 0);
-  SQLSetStmtAttr(position->hstmt, SQL_ATTR_ROW_BIND_TYPE,  (SQLPOINTER) SQL_BIND_BY_COLUMN, 0);
-
-  sds sql = sdsnew("SELECT ");
-  bool emit_comma = false;
-  btrvodbc_field_definition_t *fld, *fld_tmp;
-  HASH_ITER(hh_id, file_entry->fields_by_id, fld, fld_tmp) {
-    if (true == emit_comma) {
-      sql = sdscat(sql, ", ");
-    }
-    sql = sdscat(sql, fld->column_name);
-    emit_comma = true;
-  }
-  sql = sdscatfmt(sql, " FROM %s", file_entry->table_name);
-  log_debug("PRE-INDEX SQL IS [%s]", sql);
-
-  /*
-   * XXX FIXME
-   * We need to know which index to use based on ckeynum and amend the SQL
-   * statement accordingly. For now, hard-code this bad boy.
-   */
-  //if (0 == ckeynum) {
-  {
-    ii = 0;
-    HASH_ITER(hh_id, file_entry->fields_by_id, fld, fld_tmp) {
-      if (ckeynum == ii++) {
-        log_trace("field is [%s]", fld->name);
-        break;
-      }
-    }
-    switch (fld->data_type) {
-      case INTEGER_TYPE:
-        {
-          BTI_LONG id = *(BTI_LONG BTI_FAR *) &keyBuffer[0];
-          log_trace("Key is %lu", id);
-          sql = sdscatfmt(sql, " WHERE %s = %U", fld->column_name, id);
-        }
-        break;
-      case STRING_TYPE:
-      case ZSTRING_TYPE:
-        {
-          log_trace("Key is %s", keyBuffer);
-          sql = sdscatfmt(sql, " WHERE %s = '%s'", fld->column_name, keyBuffer);
-        }
-        break;
-    }
-  }
-  log_debug("POST-INDEX SQL IS [%s]", sql);
-
-  retcode = SQLPrepare(position->hstmt, (SQLCHAR*) sql, SQL_NTS);
-
-  CHECK_ERROR(retcode, "SQLPrepare", position->hstmt, SQL_HANDLE_STMT);
-
-  SQLSMALLINT     NumParams;
-  SQLNumParams(position->hstmt, &NumParams);
-  CHECK_ERROR(retcode, "SQLNumParams", position->hstmt, SQL_HANDLE_STMT);
-  log_debug("Num params : %i\n", NumParams);
-
-  SQLSMALLINT     NumColumns;
-  SQLNumResultCols(position->hstmt, &NumColumns);
-  CHECK_ERROR(retcode, "SQLNumColumns", position->hstmt, SQL_HANDLE_STMT);
-  log_debug("Num result columns : %i\n", NumColumns);
-
-  SQLSMALLINT     DataType, DecimalDigits, Nullable, paramNo;
-  SQLULEN         bytesRemaining;
-
-  if (NumColumns) {
-    log_debug("Num Columns : %i\n", NumColumns);
-    for (ii = 0; ii < NumColumns; ii++) {
-      // Describe the parameter.
-      retcode = SQLDescribeCol(position->hstmt,
-                               ii+1,
-                               ColName, 255,
-                               &ColNameLen,
-                               &DataType,
-                               &ColumnSize,
-                               &DecimalDigits,
-                               &Nullable);
-
-      CHECK_ERROR(retcode, "SQLDescribeCol()",
-                  position->hstmt, SQL_HANDLE_STMT);
-
-      log_debug("Data Type : %i, ColName : %s, DecimalDigits : %i, Nullable %i\n",
-             (int)DataType, ColName, (int)DecimalDigits, (int)Nullable);
-
-      AllocBuffer (ColNameLen+1, &ColNameArray[ii], NULL);
-      strcpy(ColNameArray[ii], (const char *) ColName);
-      ColDataTypeArray[ii]=DataType;
-++ColumnSize; // JHH FIX?
-
-      if (DataType==SQL_LONGVARCHAR) {
-          AllocBuffer(MAXBATCHSIZE, &ColPtrArray[ii],
-                                          &ColBufferLenArray[ii]);
-      } else {
-          AllocBuffer(ColumnSize, &ColPtrArray[ii],
-                                          &ColBufferLenArray[ii]);
-      }
-
-      log_debug("Col Buffer Ptr : %p\n",
-                                      (SQLPOINTER *) ColPtrArray[ii]);
-      log_debug("Col Buffer Len : %i\n",
-                                      (int)ColBufferLenArray[ii]);
-
-      if (DataType==SQL_LONGVARCHAR)  {
-          //
-          // For LONGVARCHAR Columns, we get the first 'Buffer Length'
-          // or chunk of data in the first SQLFetch(). For the rest, we
-          // can use SQLGetData which will return the whole column (albeit
-          // in 'Buffer Length' chunks). This means by using SQLFetch
-          // followed by SQLGetData we actually get the first chuck
-          // twice. So, we can either NOT BIND, and SQLFetch wont give
-          // us the first chunk or BIND and ignore the first chunk when
-          // we use SQLGetData.
-          //
-          retcode = SQLBindCol (
-                          position->hstmt,                     // Statment Handle
-                          ii+1,                       // Column Number
-                          SQL_C_CHAR,                // C Type
-                          ColPtrArray[ii],            // Column value Pointer
-                          ColBufferLenArray[ii],      // Buffer Length
-                          &ColLenOrIndArray[ii]); // Len or Indicator
-
-      } else {
-          // Bind the memory to the parameter.
-          retcode = SQLBindCol (
-                          position->hstmt,
-                          ii+1,
-                          SQL_C_CHAR,
-                          ColPtrArray[ii],
-                          ColBufferLenArray[ii],
-                          &ColLenOrIndArray[ii]);
-      }
-
-      CHECK_ERROR(retcode, "SQLBindCol()",
-                                              position->hstmt, SQL_HANDLE_STMT);
-    }
-  } else {
-    log_debug("No Columns\n");
-  }
-
-  retcode = SQLExecute (position->hstmt);
-  if ((retcode!=SQL_NEED_DATA)
-      && (retcode!=SQL_SUCCESS)
-      && (retcode!=SQL_SUCCESS_WITH_INFO)) {
-    CHECK_ERROR(retcode, "SQLExecute()", position->hstmt, SQL_HANDLE_STMT);
-  }
-
-  // initialise buffers
-  for (ii=0;ii<NumColumns;ii++) {
-      memset( ColPtrArray[ii], ' ', ColBufferLenArray[ii]);
-      strcpy (ColPtrArray[ii], "");
-  }
-
-  /* JHH FIX this should only fetch one */
-  retcode = SQLFetchScroll(position->hstmt, SQL_FETCH_FIRST, 0);
-  if (SQL_SUCCESS != retcode && SQL_SUCCESS_WITH_INFO != retcode) {
-    log_debug("Nothing to fetch");
-    return B_KEY_VALUE_NOT_FOUND;
-  }
-  CHECK_ERROR(retcode, "SQLFetch()", position->hstmt, SQL_HANDLE_STMT);
-
-  for (ii = 0; ii < NumColumns; ++ii) {
-    HASH_FIND(hh_column_name, file_entry->fields_by_column_name,
-      ColNameArray[ii], strlen(ColNameArray[ii]), fld);
-    if (NULL == fld) {
-      printf("Couldn't find file entry for field [%s]\n", ColNameArray[ii]);
-    }
-btrvodbc_dump_field(fld);
-
-    log_debug("\nColumn : %i", ii);
-    log_debug("\nName   : %s (SQL) / %s (Btrieve)",
-      (char *) ColNameArray[ii], fld->column_name);
-    log_debug("\nType   : %i", (int) ColDataTypeArray[ii]);
-
-    // As we are BINDING LONGVARCHAR columns in this example, we
-    // ignore the chunk of data returned by the SQLFetch. We get
-    // the whole column regardless.
-    if (ColDataTypeArray[ii] == SQL_LONGVARCHAR) {
-        log_debug("\nValueLVC: ");
-        while ((retcode = SQLGetData(position->hstmt,
-                                     ii+1,
-                                     SQL_CHAR,
-                                     ColPtrArray[ii],
-                                     ColBufferLenArray[ii],
-                                     &ColLenOrIndArray[ii]))
-                                     != SQL_NO_DATA) {
-            CHECK_ERROR(retcode, "SQLGetData()",
-                        position->hstmt, SQL_HANDLE_STMT);
-
-            log_debug("\n                  %s",
-                                        (char *) ColPtrArray[ii]);
-        }
-    } else {
-      log_debug("\nValue  : %s",
-                                      (char *) ColPtrArray[ii]);
-      switch (fld->data_type) {
-        case STRING_TYPE:
-        case ZSTRING_TYPE:
-          log_trace("ret(STRING) -> %s\n", (char *) ColPtrArray[ii]);
-#if 0
-          log_trace("stpncpy(&dataBuffer[%d], \"%s\", %d);\n",
-            fld->offset, (char *) ColPtrArray[ii], fld->size);
-#endif
-          stpncpy(&dataBuffer[fld->offset], (char *) ColPtrArray[ii], fld->size);
-          break;
-
-        case INTEGER_TYPE:
-          log_trace("INTEGER\n");
-          {
-            switch (fld->size) {
-              case sizeof(BTI_CHAR):
-                {
-                  BTI_CHAR ret = (BTI_CHAR) strtol((char *) ColPtrArray[ii], NULL, 10);
-                  log_trace("ret(%zd) -> %"PRId8"\n", sizeof(BTI_CHAR), (int8_t) ret);
-                  *(BTI_CHAR *) &dataBuffer[fld->offset] = ret;
-                }
-                break;
-              case sizeof(BTI_SINT):
-                {
-                  BTI_SINT ret = (BTI_SINT) strtol((char *) ColPtrArray[ii], NULL, 10);
-                  log_trace("ret(%zd) -> %"PRId16"\n", sizeof(BTI_SINT), (int16_t) ret);
-                  *(BTI_SINT *) &dataBuffer[fld->offset] = ret;
-                }
-                break;
-              case sizeof(BTI_INT):
-                {
-                  BTI_INT ret = (BTI_INT) strtol((char *) ColPtrArray[ii], NULL, 10);
-                  log_trace("ret(%zd) -> %"PRId32"\n", sizeof(BTI_INT), (int32_t) ret);
-                  *(BTI_INT *) &dataBuffer[fld->offset] = ret;
-                }
-                break;
-              case sizeof(BTI_LONG):
-                {
-                  BTI_LONG ret = (BTI_LONG) strtol((char *) ColPtrArray[ii], NULL, 10);
-                  log_trace("ret(%zd) -> %"PRId64"\n", sizeof(BTI_LONG), (int64_t) ret);
-                  *(BTI_LONG *) &dataBuffer[fld->offset] = ret;
-                }
-                break;
-            }
-          }
-          break;
-
-        case IEEE_TYPE:
-          log_trace("IEEE\n");
-          {
-            switch (fld->size) {
-              case sizeof(float):
-                {
-                  float ret = strtof((char *) ColPtrArray[ii], NULL);
-                  log_trace("ret(%zd) -> %f\n", sizeof(float), ret);
-                  *(float *) &dataBuffer[fld->offset] = ret;
-                }
-                break;
-              case sizeof(double):
-                {
-                  double ret = strtod((char *) ColPtrArray[ii], NULL);
-                  log_trace("ret(%zd) -> %f\n", sizeof(double), ret);
-                  *(double *) &dataBuffer[fld->offset] = ret;
-                }
-                break;
-            }
-          }
-      }
-    }
-  }
-  return B_NO_ERROR;
-
-#if 0
-  // Execute a statement to retrieve rows from the Customers table.
-  SQLExecDirect(hstmt, sql, SQL_NTS);
-
-  // Fetch and display the first 10 rows.
-  rc = SQLFetchScroll(hstmt, SQL_FETCH_NEXT, 0);
-#endif
-exit:
-    sdsfree(sql);
-
-  return B_INVALID_FUNCTION;
 } /* btrvodbc_b_get_equal() */
 
 /* ------------------------------------------------------------------------- */
@@ -902,7 +617,6 @@ BTRVODBC_DEFINE_HANDLER(b_get_next) {
   log_trace("Entering Function %s", __func__);
   return btrvodbc_common_get(operation, posBlock, dataBuffer,
     dataLength, keyBuffer, keyLength, ckeynum, clientID);
-  //return B_INVALID_FUNCTION;
 } /* btrvodbc_b_get_next() */
 
 /* ------------------------------------------------------------------------- */
@@ -914,36 +628,96 @@ BTRVODBC_DEFINE_HANDLER(b_get_previous) {
 /* ------------------------------------------------------------------------- */
 
 BTRVODBC_DEFINE_HANDLER(b_get_gt) {
-  return B_INVALID_FUNCTION;
+  /*
+   * Build row-set comparison of keys as:
+   *
+   *  SELECT col0, ..., colN
+   *    FROM table
+   *   WHERE (col0_in_key, ..., colN_in_key)
+   *            > (keyBuffer[col0_offset], ..., keyBuffer[colN_offset])
+   *   ORDER BY col0_in_key, ..., colN_in_key;
+   */
+  log_trace("Entering Function %s", __func__);
+  return btrvodbc_common_get(operation, posBlock, dataBuffer,
+    dataLength, keyBuffer, keyLength, ckeynum, clientID);
 } /* btrvodbc_b_get_gt() */
 
 /* ------------------------------------------------------------------------- */
 
 BTRVODBC_DEFINE_HANDLER(b_get_ge) {
-  return B_INVALID_FUNCTION;
+  /*
+   * Build row-set comparison of keys as:
+   *
+   *  SELECT col0, ..., colN
+   *    FROM table
+   *   WHERE (col0_in_key, ..., colN_in_key)
+   *            >= (keyBuffer[col0_offset], ..., keyBuffer[colN_offset])
+   *   ORDER BY col0_in_key, ..., colN_in_key;
+   */
+  log_trace("Entering Function %s", __func__);
+  return btrvodbc_common_get(operation, posBlock, dataBuffer,
+    dataLength, keyBuffer, keyLength, ckeynum, clientID);
 } /* btrvodbc_b_get_ge() */
 
 /* ------------------------------------------------------------------------- */
 
 BTRVODBC_DEFINE_HANDLER(b_get_lt) {
-  return B_INVALID_FUNCTION;
+  /*
+   * Build row-set comparison of keys as:
+   *
+   *  SELECT col0, ..., colN
+   *    FROM table
+   *   WHERE (col0_in_key, ..., colN_in_key)
+   *            < (keyBuffer[col0_offset], ..., keyBuffer[colN_offset])
+   *   ORDER BY col0_in_key, ..., colN_in_key;
+   */
+  log_trace("Entering Function %s", __func__);
+  return btrvodbc_common_get(operation, posBlock, dataBuffer,
+    dataLength, keyBuffer, keyLength, ckeynum, clientID);
 } /* btrvodbc_b_get_lt() */
 
 /* ------------------------------------------------------------------------- */
 
 BTRVODBC_DEFINE_HANDLER(b_get_le) {
-  return B_INVALID_FUNCTION;
+  /*
+   * Build row-set comparison of keys as:
+   *
+   *  SELECT col0, ..., colN
+   *    FROM table
+   *   WHERE (col0_in_key, ..., colN_in_key)
+   *            <= (keyBuffer[col0_offset], ..., keyBuffer[colN_offset])
+   *   ORDER BY col0_in_key, ..., colN_in_key;
+   */
+  log_trace("Entering Function %s", __func__);
+  return btrvodbc_common_get(operation, posBlock, dataBuffer,
+    dataLength, keyBuffer, keyLength, ckeynum, clientID);
 } /* btrvodbc_b_get_le() */
 
 /* ------------------------------------------------------------------------- */
 
 BTRVODBC_DEFINE_HANDLER(b_get_first) {
-  return B_INVALID_FUNCTION;
+  /*
+   * Build row-set comparison of keys as:
+   *
+   *  SELECT col0, ..., colN
+   *    FROM table
+   *   ORDER BY col0_in_key, ..., colN_in_key;
+   */
+  log_trace("Entering Function %s", __func__);
+  return btrvodbc_common_get(operation, posBlock, dataBuffer,
+    dataLength, keyBuffer, keyLength, ckeynum, clientID);
 } /* btrvodbc_b_get_first() */
 
 /* ------------------------------------------------------------------------- */
 
 BTRVODBC_DEFINE_HANDLER(b_get_last) {
+  /*
+   * Build row-set comparison of keys as:
+   *
+   *  SELECT col0, ..., colN
+   *    FROM table
+   *   ORDER BY col0_in_key, ..., colN_in_key DESC LIMIT 1;
+   */
   return B_INVALID_FUNCTION;
 } /* btrvodbc_b_get_last() */
 
@@ -1256,17 +1030,33 @@ hexdump (
   }
 }
 
+/* ------------------------------------------------------------------------- */
+
 BTRVODBC_DEFINE_HANDLER(common_get) {
   log_trace("Entering Function %s", __func__);
-  SQLRETURN retcode;      // Return status
-  
+
   btrvodbc_client_t *client = btrvodbc_upsert_client(clientID);
+
   btrvodbc_position_pointer_t *posptr =
     (btrvodbc_position_pointer_t *) posBlock;
+
   btrvodbc_position_t *position = posptr->position;
   btrvodbc_file_definition_t *file_entry = position->file;
-  
-  log_trace("File id is %"PRId16" with SQL Table [%s]",
+  btrvodbc_index_definition_t *index_entry = NULL;
+
+  SQLRETURN retcode;
+  SQLSMALLINT fetch_orientation = SQL_FETCH_FIRST;
+  SQLLEN fetch_offset = 0;
+
+  /* Commonly used iterators */
+  int ii = 0;
+  btrvodbc_field_definition_t *fld = NULL;
+  btrvodbc_field_definition_t *fldtmp = NULL;
+  btrvodbc_index_definition_t *idx = NULL;
+  btrvodbc_index_definition_t *idxtmp = NULL;
+
+  //log_trace("File id is %"PRId16" with SQL Table [%s]",
+  log_debug("File id is %"PRId16" with SQL Table [%s]",
     file_entry->id, file_entry->table_name);
 
   if (client != posptr->client) {
@@ -1274,113 +1064,155 @@ BTRVODBC_DEFINE_HANDLER(common_get) {
     abort();
   }
 
+  /*
+   * I haven't tested the order in which Btrieve applies these checks but, I
+   * figure, an application with proper error-checking probably shouldn't be
+   * negatively affected either way...
+   */
 
-  char *Str;
-  PTR  pParamID;
-  int ii, j=0;
-
-  SQLLEN      siText;
-
-#if 0
-  // initialise pointer arrays so can be freed
-  for (ii=0;ii<MAXFIELDS;ii++) {
-    ParamPtrArray[ii]=NULL;
+  /* Validate ckeynum & return index info */
+  HASH_FIND(hh_number, file_entry->indices_by_number, &ckeynum,
+    sizeof(ckeynum), index_entry);
+  if (NULL == index_entry) {
+    log_debug("Invalid Key Number (%d)", ckeynum);
+    return B_INVALID_KEYNUMBER;
   }
 
-  for (ii=0;ii<MAXFIELDS;ii++) {
-    ColPtrArray[ii]=NULL;
-  }
-#endif
-
-  sds sql = sdsnew("SELECT ");
-  bool emit_comma = false;
-  btrvodbc_field_definition_t *fld, *fld_tmp;
-  HASH_ITER(hh_id, file_entry->fields_by_id, fld, fld_tmp) {
-    if (true == emit_comma) {
-      sql = sdscat(sql, ", ");
+  if (ckeynum != position->key_number) {
+    /*
+     * If this is a positional operation and the requested key differs from the
+     * one used to position the original result set, return an error.
+     */
+    if ((B_GET_NEXT == operation)
+        || (B_GET_NEXT_EXTENDED == operation)
+        || (B_GET_PREVIOUS == operation)
+        || (B_GET_PREV_EXTENDED == operation)) {
+      return B_DIFFERENT_KEYNUMBER;
     }
-    sql = sdscat(sql, fld->column_name);
-    emit_comma = true;
+
+    /* Update the key number */
+    position->key_number = ckeynum;
   }
-  sql = sdscatfmt(sql, " FROM %s", file_entry->table_name);
-  log_debug("PRE-INDEX SQL IS [%s]", sql);
 
   /*
-   * XXX FIXME
-   * We need to know which index to use based on ckeynum and amend the SQL
-   * statement accordingly. For now, hard-code this bad boy.
-   * NOTE: Take into account ORDER BY for cursors
+   * If this is a first or last operation, we only need to apply the SQL ORDER
+   * BY clause.
    */
-  //if (0 == ckeynum) {
-  uint32_t hash = 0;
-  {
+
+  /*
+   * For all key-based get operations, we build a SQL WHERE clause using
+   * row-wise comparison syntax.
+   *
+   * While this is part of SQL92, it's not supported by most databases. As
+   * such, even though we're using ODBC, the SQL generated here MAY NOT WORK
+   * with the underlying database. This is used primarily because compound
+   * indices will, if available, normally be selected and it gives us an
+   * even closer-to-ISAM like scanning of relations using multi-part keys
+   * without relying on cursors. 
+   */
+  sds sql = sdsdup(position->query); /* XXX Remove for fetch-only ops */
+  if ((B_GET_EQUAL == operation) || (B_GET_GE == operation)
+      || (B_GET_GT == operation) || (B_GET_LE == operation)
+      || (B_GET_LT == operation)) {
+
+    sds row_cmp_lvalue = sdsempty();
+    sds row_cmp_rvalue = sdsempty();
+
     ii = 0;
-    HASH_ITER(hh_id, file_entry->fields_by_id, fld, fld_tmp) {
-      if (ckeynum == ii++) {
-        log_trace("field is [%s]", fld->name);
-        break;
+    LL_FOREACH_SAFE(index_entry, idx, idxtmp) {
+      log_trace("Key %d / Part %d / Field %d", idx->number, idx->part, idx->field_id);
+      if (0 < ii) {
+        row_cmp_lvalue = sdscat(row_cmp_lvalue, ", ");
+        row_cmp_rvalue = sdscat(row_cmp_rvalue, ", ");
       }
-    }
-    switch (fld->data_type) {
-      case INTEGER_TYPE:
-        {
-          BTI_LONG id = *(BTI_LONG BTI_FAR *) &keyBuffer[0];
-          hash = hashlittle(keyBuffer, sizeof(BTI_LONG), 0);
-          log_trace("Key is %lu", id);
-          sql = sdscatfmt(sql, " WHERE %s = %U", fld->column_name, id);
-        }
-        break;
-      case STRING_TYPE:
-      case ZSTRING_TYPE:
-        {
-          log_trace("Key is %s", keyBuffer);
-          hash = hashlittle(keyBuffer, fld->size, 0);
-          sql = sdscatfmt(sql, " WHERE %s = '%s'", fld->column_name, keyBuffer);
-        }
-        break;
-    }
-  }
-  log_debug("POST-INDEX SQL IS [%s]", sql);
-#if 0
-  printf("hash [%"PRIu32"]\n", hash);
-  printf("old hash [%"PRIu32"]\n", position->key_buffer_hash);
-#endif
-  if (hash != position->key_buffer_hash) {
-    position->key_buffer_hash = hash;
-    //printf("Different key!\n");
-    // Allocate Statement Handle
-    retcode = SQLAllocHandle(SQL_HANDLE_STMT, client->hdbc,
-      &position->hstmt);
-    CHECK_ERROR(retcode, "SQLAllocHandle(SQL_HANDLE_STMT)",
-                position->hstmt, SQL_HANDLE_STMT);
 
-    // Set the SQL_ATTR_ROW_BIND_TYPE statement attribute to use column-wise
-    // binding. Declare the rowset size with the SQL_ATTR_ROW_ARRAY_SIZE
-    // statement attribute. Set the SQL_ATTR_ROW_STATUS_PTR statement
-    // attribute to point to the row status array.
-    SQLSetStmtAttr(position->hstmt, SQL_ATTR_CURSOR_TYPE,  (SQLPOINTER) SQL_CURSOR_KEYSET_DRIVEN, 0);
-    SQLSetStmtAttr(position->hstmt, SQL_ATTR_ROW_BIND_TYPE,  (SQLPOINTER) SQL_BIND_BY_COLUMN, 0);
+      HASH_FIND(hh_id, file_entry->fields_by_id, &idx->field_id,
+        sizeof(idx->field_id), fld);
+      if (NULL == fld) {
+        log_error("Couldn't find field %d", idx->field_id);
+      }
 
-    /* Allocate & Bind */
-    ii = 0;
-    HASH_ITER(hh_id, file_entry->fields_by_id, fld, fld_tmp) {
-      //AllocBuffer(ColumnSize, &position->results[ii],
-      //printf("Allocating field [%s]\n", fld->name);
-      AllocBuffer(128, &position->results[ii],
-        &position->result_lengths[ii]);
-      retcode = SQLBindCol(position->hstmt, (ii + 1), SQL_C_CHAR,
-        position->results[ii], position->result_lengths[ii],
-        &position->result_lengths_or_indicators[ii]);
-      CHECK_ERROR(retcode, "SQLBindCol()", position->hstmt,
-        SQL_HANDLE_STMT);
+      row_cmp_lvalue = sdscatfmt(row_cmp_lvalue, "%s", fld->column_name);
+
+      switch (fld->data_type) {
+        case INTEGER_TYPE:
+          {
+            BTI_LONG id = *(BTI_LONG BTI_FAR *) &keyBuffer[0];
+            //hash = hashlittle(keyBuffer, sizeof(BTI_LONG), 0);
+            log_trace("Key is %lu", id);
+            row_cmp_rvalue = sdscatfmt(row_cmp_rvalue, "%U", id);
+          }
+          break;
+        case STRING_TYPE:
+        case ZSTRING_TYPE:
+          {
+            log_trace("Key is %s", keyBuffer);
+            //hash = hashlittle(keyBuffer, fld->size, 0);
+            row_cmp_rvalue = sdscatfmt(row_cmp_rvalue, "'%s'", keyBuffer);
+          }
+          break;
+      }
       ++ii;
     }
+
+    sds row_cmp_operator = NULL;
+    switch (operation) {
+      case B_GET_EQUAL:
+        row_cmp_operator = sdsnew("=");
+        fetch_orientation = SQL_FETCH_FIRST;
+        break;
+      case B_GET_GT:
+        row_cmp_operator = sdsnew(">");
+        fetch_orientation = SQL_FETCH_FIRST;
+        break;
+      case B_GET_GE:
+        row_cmp_operator = sdsnew(">=");
+        fetch_orientation = SQL_FETCH_FIRST;
+        break;
+      case B_GET_LT:
+        row_cmp_operator = sdsnew("<");
+        fetch_orientation = SQL_FETCH_LAST;
+        break;
+      case B_GET_LE:
+        row_cmp_operator = sdsnew("<=");
+        fetch_orientation = SQL_FETCH_LAST;
+        break;
+    }
+
+    sql = sdscatfmt(sql, " WHERE (%s) %s (%s)",
+      row_cmp_lvalue, row_cmp_operator, row_cmp_rvalue);
+
+    sdsfree(row_cmp_lvalue);
+    sdsfree(row_cmp_operator);
+    sdsfree(row_cmp_rvalue);
   }
 
-  if (B_GET_EQUAL == operation) {
+  if (!((B_GET_NEXT == operation)
+        || (B_GET_NEXT_EXTENDED == operation)
+        || (B_GET_PREVIOUS == operation)
+        || (B_GET_PREV_EXTENDED == operation))) {
+    sds sql_order_by_clause = sdsempty();
+    ii = 0;
+    LL_FOREACH_SAFE(index_entry, idx, idxtmp) {
+      HASH_FIND(hh_id, file_entry->fields_by_id, &idx->field_id,
+        sizeof(idx->field_id), fld);
+      if (NULL == fld) {
+        log_error("Couldn't find field %d", idx->field_id);
+      }
+      if (0 < ii) {
+        sql_order_by_clause = sdscat(sql_order_by_clause, ", ");
+      }
+      sql_order_by_clause = sdscatfmt(sql_order_by_clause, "%s",
+        fld->column_name);
+      ++ii;
+    }
+    sql = sdscatfmt(sql, " ORDER BY %s", sql_order_by_clause);
+
+    /* If there's already a cursor, we need to close it */
     SQLCloseCursor(position->hstmt);
 
     /* This can be called from other ops too XXX FIX */
+    log_debug("Executing SQL [%s]", sql);
     retcode = SQLExecDirect(position->hstmt, (SQLCHAR *) sql, SQL_NTS);
     if ((retcode!=SQL_NEED_DATA)
         && (retcode!=SQL_SUCCESS)
@@ -1388,19 +1220,16 @@ BTRVODBC_DEFINE_HANDLER(common_get) {
       CHECK_ERROR(retcode, "SQLExecute()", position->hstmt, SQL_HANDLE_STMT);
     }
   }
+  sdsfree(sql);
 
-  // initialise buffers
-  //printf("Clearing buffer %d\n", HASH_CNT(hh_id, file_entry->fields_by_id));
+  /* Clear out bound buffers */
   for (ii = 0
-      ; ii < HASH_CNT(hh_id, file_entry->fields_by_id)
-      ; ++ii) {
-      memset(position->results[ii], ' ', position->result_lengths[ii]);
-      strcpy(position->results[ii], "");
+    ; ii < HASH_CNT(hh_id, file_entry->fields_by_id)
+    ; ++ii) {
+    memset(position->results[ii], ' ', position->result_lengths[ii]);
+    strcpy(position->results[ii], "");
   }
 
-  /* JHH FIX this should only fetch one */
-  SQLSMALLINT fetch_orientation = SQL_FETCH_FIRST;
-  SQLLEN fetch_offset = 0;
 
   if (B_GET_NEXT == operation) {
     fetch_orientation = SQL_FETCH_NEXT;
@@ -1410,7 +1239,7 @@ BTRVODBC_DEFINE_HANDLER(common_get) {
     log_debug("Nothing to fetch");
 
     /* XXX FIX */
-    if (operation == B_GET_EQUAL) {
+    if (B_GET_EQUAL == operation) {
       return B_KEY_VALUE_NOT_FOUND;
     } else {
       return B_END_OF_FILE;
@@ -1419,7 +1248,7 @@ BTRVODBC_DEFINE_HANDLER(common_get) {
   CHECK_ERROR(retcode, "SQLFetch()", position->hstmt, SQL_HANDLE_STMT);
 
   ii = 0;
-  HASH_ITER(hh_id, file_entry->fields_by_id, fld, fld_tmp) {
+  HASH_ITER(hh_id, file_entry->fields_by_id, fld, fldtmp) {
     btrvodbc_dump_field(fld);
     log_debug("Value... [%s]", (char *) position->results[ii]);
     switch (fld->data_type) {
@@ -1493,17 +1322,14 @@ BTRVODBC_DEFINE_HANDLER(common_get) {
     ++ii;
   }
 
+  /* Copy back the key into keyBuffer */
+  LL_FOREACH_SAFE(index_entry, idx, idxtmp) {
+    /* XXX FIX */
+  }
+
   return B_NO_ERROR;
 
-#if 0
-  // Execute a statement to retrieve rows from the Customers table.
-  SQLExecDirect(hstmt, sql, SQL_NTS);
-
-  // Fetch and display the first 10 rows.
-  rc = SQLFetchScroll(hstmt, SQL_FETCH_NEXT, 0);
-#endif
 exit:
-    sdsfree(sql);
 
   return B_INVALID_FUNCTION;
 }
@@ -1638,6 +1464,61 @@ btrvodbc_sqlite_field_cb (
 
 /* ------------------------------------------------------------------------- */
 
+static int
+btrvodbc_sqlite_index_cb (
+  void                 *data,
+  int                   argc,
+  char                **argv,
+  char                **azColName
+) {
+  btrvodbc_file_definition_t *file_entry = NULL;
+  btrvodbc_field_definition_t *field_entry = NULL;
+  btrvodbc_index_definition_t *head_index_entry = NULL;
+  btrvodbc_index_definition_t *index_entry = calloc(1, sizeof(*index_entry));
+
+  index_entry->file_id = (BTI_SINT) strtol(argv[0], NULL, 10);
+  index_entry->field_id = (BTI_SINT) strtol(argv[1], NULL, 10);
+  index_entry->number = (BTI_CHAR) strtol(argv[2], NULL, 10);
+  index_entry->part = (BTI_CHAR) strtol(argv[3], NULL, 10);
+  index_entry->flags = (BTI_SINT) strtol(argv[4], NULL, 10);
+
+  HASH_FIND(hh_id, btrvodbc_global_files_by_id, &index_entry->file_id,
+    sizeof(index_entry->file_id), file_entry);
+  if (NULL == file_entry) {
+    log_error("Couldn't find file (%d) for index (%d part %d) on field (%d)",
+      index_entry->file_id, index_entry->number, index_entry->part,
+      index_entry->field_id);
+    free(index_entry);
+    return 1;
+  }
+
+  HASH_FIND(hh_id, file_entry->fields_by_id, &index_entry->field_id,
+    sizeof(index_entry->field_id), field_entry);
+  if (NULL == field_entry) {
+    log_error("Couldn't find field (%d) for index (%d part %d) on field (%d)",
+      index_entry->file_id, index_entry->number, index_entry->part,
+      index_entry->field_id);
+    free(index_entry);
+    return 1;
+  }
+
+  HASH_FIND(hh_number, file_entry->indices_by_number, &index_entry->number,
+    sizeof(index_entry->number), head_index_entry);
+  if (NULL == head_index_entry) {
+    HASH_ADD(hh_number, file_entry->indices_by_number, number,
+      sizeof(index_entry->number), index_entry);
+  } else {
+    LL_APPEND(head_index_entry, index_entry);
+  }
+
+  log_debug("Loaded INDEX.DDF entry for field (%s.%s)",
+    file_entry->name, field_entry->name);
+
+  return 0;
+} /* btrvodbc_sqlite_field_cb() */
+
+/* ------------------------------------------------------------------------- */
+
 void
 btrvodbc_initialize (
   void
@@ -1676,6 +1557,16 @@ btrvodbc_initialize (
     btrvodbc_sqlite_field_cb, (void *) NULL, &zErrMsg);
   if (SQLITE_OK != rc) {
     log_fatal("Error querying B$FieldMapping: %s", zErrMsg);
+    sqlite3_free(zErrMsg);
+    abort();
+  }
+
+  /* Load our equivalent of INDEX.DDF */
+  rc = sqlite3_exec(db,
+    "SELECT * FROM X$Index ORDER BY Xi$File, Xi$Number, Xi$Part",
+    btrvodbc_sqlite_index_cb, (void *) NULL, &zErrMsg);
+  if (SQLITE_OK != rc) {
+    log_fatal("Error querying X$Index: %s", zErrMsg);
     sqlite3_free(zErrMsg);
     abort();
   }
@@ -1772,7 +1663,12 @@ BTRCALLID (
   BTI_BUFFER_PTR        clientID
 ) {
   log_trace("Entering Function %s", __func__);
-  log_debug("Call for op %d", operation);
+
+#if 0
+  log_info("%s (%d, %p, %p, %ld, %p, %d, %d, %p)",
+    __func__, operation, posBlock, dataBuffer, (long int) *dataLength,
+    keyBuffer, keyLength, ckeynum, clientID);
+#endif
 
   if (unlikely(false == btrvodbc_is_initialized)) {
     btrvodbc_initialize();
@@ -1805,7 +1701,7 @@ BTRCALL (
 ) {
   log_trace("Entering Function %s", __func__);
 
-  BTI_BYTE id[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'M', 'T', 0, 1 }; 
+  BTI_BYTE id[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'M', 'T', 0, 1 };
   return BTRCALLID(operation, posBlock, dataBuffer, dataLength,
     keyBuffer, keyLength, ckeynum, (BTI_BUFFER_PTR) &id);
 } /* BTRCALL() */

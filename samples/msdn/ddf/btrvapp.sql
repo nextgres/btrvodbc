@@ -23,6 +23,10 @@ INSERT INTO X$Field VALUES (32, 5, 'OrdNum', 0, 12, 21, 0, 0);
 INSERT INTO X$Field VALUES (33, 5, 'Qty', 1, 36, 4, 0, 0);
 INSERT INTO X$Field VALUES (34, 5, 'PayTerms', 0, 40, 13, 0, 0);
 
+-- Simulate Entries in INDEX.DDF
+INSERT INTO X$Index VALUES (4, 18, 0, 0, 0);
+INSERT INTO X$Index VALUES (5, 31, 1, 0, 0);
+
 -- Add our PostgreSQL DSN
 INSERT INTO B$Datasource VALUES (1, 'pgdb');
 
