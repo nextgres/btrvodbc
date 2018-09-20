@@ -175,6 +175,8 @@ typedef struct btrvodbc_position_t {
   SQLHSTMT                      hstmt;
   sds                           query;
   BTI_CHAR                      key_number;
+  BTI_WORD                      last_execute_operation;
+  int64_t                       relative_fetch_offset;
   uint32_t                      key_buffer_hash;
   SQLPOINTER                    results[MAXFIELDS];
   SQLPOINTER                    result_names[MAXFIELDS];
@@ -1211,6 +1213,9 @@ BTRVODBC_DEFINE_HANDLER(common_get) {
     /* If there's already a cursor, we need to close it */
     SQLCloseCursor(position->hstmt);
 
+    position->last_execute_operation = operation;
+    position->relative_fetch_offset = 0;
+
     /* This can be called from other ops too XXX FIX */
     log_debug("Executing SQL [%s]", sql);
     retcode = SQLExecDirect(position->hstmt, (SQLCHAR *) sql, SQL_NTS);
@@ -1234,9 +1239,15 @@ BTRVODBC_DEFINE_HANDLER(common_get) {
   if (B_GET_NEXT == operation) {
     fetch_orientation = SQL_FETCH_NEXT;
   }
+
   retcode = SQLFetchScroll(position->hstmt, fetch_orientation, 0);
   if (SQL_SUCCESS != retcode && SQL_SUCCESS_WITH_INFO != retcode) {
     log_debug("Nothing to fetch");
+
+    /*
+     * Are we possibly out of bounds from the original fetch?
+     * Consider B_GET_EQUAL -> READ ALL EQUAL -> SHOULD RESULT IN NEXT
+     */
 
     /* XXX FIX */
     if (B_GET_EQUAL == operation) {
@@ -1246,6 +1257,16 @@ BTRVODBC_DEFINE_HANDLER(common_get) {
     }
   }
   CHECK_ERROR(retcode, "SQLFetch()", position->hstmt, SQL_HANDLE_STMT);
+
+  /* Handle relative offsets to know when we need to re-execute */
+  switch (fetch_orientation) {
+    case SQL_FETCH_NEXT:
+      ++position->relative_fetch_offset;
+      break;
+    case SQL_FETCH_PREV:
+      --position->relative_fetch_offset;
+      break;
+  }
 
   ii = 0;
   HASH_ITER(hh_id, file_entry->fields_by_id, fld, fldtmp) {
